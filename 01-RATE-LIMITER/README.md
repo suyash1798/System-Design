@@ -61,9 +61,7 @@ Why:
 - Store previous window count
 - Use weighted calculation to smooth spikes
 
-Effective count formula:
-
-current_count + (previous_count × overlap_ratio)
+Effective count: `current_count + (previous_count × overlap_ratio)`
 
 ## 5. Storage Choice
 ### Redis (Preferred)
@@ -123,9 +121,9 @@ Why IP Alone Is Dangerous
 
 Best Practice
 - Apply multiple limits in parallel:
-	- IP
-	- User ID
-	- API key
+  - IP
+  - User ID
+  - API key
 - Reject the request if any applicable limit is exceeded.
 
 ## 10. Unauthenticated Users
@@ -189,12 +187,12 @@ Return headers:
 - TTL tuning to avoid hot keys
 
 ## 15. Edge / CDN Rate Limiting
-Benefits
+### Benefits
 - Lower latency
 - DDoS protection
 - Reduced origin traffic
 
-Trade-offs
+### Trade-offs
 - Limited user context
 - Less flexible rules
 
@@ -225,3 +223,93 @@ Note: Backend rate limiting remains the source of truth.
 - Edge limits are coarse, backend limits are authoritative
 - Fail open for UX, fail closed for money and security
 - An unobservable rate limiter is a hidden SPOF
+---
+
+## Design Reference
+
+### Problem Statement
+Design a rate limiter to protect backend services from abuse while maintaining low latency for legitimate users.
+
+### Requirements
+#### Functional
+- Limit requests per identity (userId / IP / API key)
+- Support different limits per endpoint (e.g., login stricter than search)
+- Reject excess requests early using HTTP 429 before hitting backend
+
+#### Non-Functional
+- Low latency and high throughput (O(1) check, in-memory)
+- Horizontally scalable and highly available
+- Best-effort consistency (small inaccuracies acceptable)
+
+### Algorithm Choice
+Token Bucket Algorithm
+
+Chosen because:
+- Allows burst traffic
+- Simple state management
+- Constant-time checks
+
+Rejected alternatives:
+- Fixed Window – burst at boundaries
+- Sliding Window – higher memory and compute cost
+
+### High-Level Architecture
+```
+Client
+	↓
+API Gateway
+	↓
+Rate Limiter Service
+	↓
+Redis Cluster
+```
+Redis is used because it is in-memory, fast, and supports atomic operations.
+
+### Data Model
+Key format:
+```
+rate:{userId}:{endpoint}
+```
+Stored values:
+```
+tokens_remaining
+last_refill_timestamp
+```
+
+### Request Flow
+1. Request reaches API Gateway
+2. Gateway calls Rate Limiter
+3. Redis executes atomic logic:
+	 - Refill tokens
+	 - If token exists → allow
+	 - Else → reject
+4. Response returned:
+	 - 200 OK or 429 Too Many Requests
+	 - Rate-limit headers
+
+Concurrency is handled using atomic operations to avoid race conditions.
+
+### Complexity
+- Time Complexity: O(1) per request
+- Space Complexity: proportional to active users
+
+### Scaling Strategy
+- Redis Cluster with sharding
+- Per-endpoint limits to avoid hot keys
+- Rate limiter deployed close to gateway
+- Multi-Region: each region enforces limits independently; no global synchronization; minor inconsistencies are acceptable
+
+### Failure Handling
+If Redis is unavailable:
+- Critical APIs (auth, payments): fail-closed
+- Non-critical APIs (public reads): fail-open
+
+The rate limiter must never become the reason production is down.
+
+### Trade-offs
+- Latency and availability over perfect accuracy
+- Best-effort consistency is sufficient
+- Keep the system simple and fast
+
+### Summary
+This design provides a fast, scalable, and highly available rate limiter that protects backend systems while tolerating small inaccuracies — the correct tradeoff at scale.
