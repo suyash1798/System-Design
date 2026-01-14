@@ -1,172 +1,190 @@
 # News Feed – System Design
 
----
-
-## Problem Statement
+## Problem statement
 Design a News Feed system that:
-- Shows posts from friends / followers
-- Supports likes, comments
-- Handles celebs with millions of followers
-- Is read-heavy, low latency, highly available
+- Shows posts from friends/followers
+- Supports likes and comments
+- Handles celebrities with millions of followers
+- Is read-heavy, low latency, and highly available
 
 ## Requirements
-
 ### Functional
 - User can create a post
-- User can see a ranked feed
-- Feed supports pagination (infinite scroll)
-- Near-real-time updates (not strict real time)
+- User can see a ranked, paginated feed (infinite scroll)
+- Near-real-time updates (seconds, not strict real time)
+- Follow/unfollow users
+- Likes/comments contribute to ranking signals
 
 ### Non-Functional
 - Read heavy (≈25–30x reads vs writes)
-- p99 latency < 200 ms
-- Highly available (eventual consistency OK)
+- p99 feed latency target < 200 ms (or stricter if required)
+- High availability; eventual consistency acceptable
 - Scalable to hundreds of millions of users
-- Freshness: near real-time (seconds)
+- Freshness: near real-time (few seconds acceptable)
 
-## Read vs Write Characteristics
+## Read vs write characteristics
 - Reads dominate writes (100:1 – 1000:1)
-- Reads are latency-sensitive (UX-critical)
+- Reads are latency-sensitive (direct UX impact)
 - Writes can be asynchronous
 
-## Scale Estimation (Back of Envelope)
+## Scale estimation (back of envelope)
 - DAU: 300M
 - Feed reads: ~170K QPS
 - Post writes: ~7K QPS
 - Followers: avg 200, max 10M+
 
-> Conclusion: Optimize reads over writes.
+Conclusion: prioritize read performance over write cost.
 
-## High-Level Architecture
-### Core Services
+## Core design insight
+- Never scan all followers on read.
+- Never rely on cache as the only source of truth.
+- Use a hybrid fanout model (industry standard).
+
+## High-level architecture
+Core services:
 - API Gateway
 - Feed Service
 - Post Service
 - Follow Graph Service
 - Ranking Service
 - Cache (Redis)
-- Storage (Cassandra / DynamoDB)
+- Storage (Cassandra/DynamoDB)
 - Message Queue (Kafka)
 
-## Feed Generation Strategy (MOST IMPORTANT)
-### Hybrid Model (Industry Standard)
+## Feed generation strategy (MOST IMPORTANT)
+### Hybrid model
 
-| User Type                      | Strategy        |
-|--------------------------------|-----------------|
-| Normal users (< 1k followers)  | Fanout-on-write |
-| Celebrities (≥ 1k followers)   | Fanout-on-read  |
+| User type                     | Strategy         |
+|------------------------------|------------------|
+| Normal users (< ~1k followers)| Fanout-on-write  |
+| Celebrities (≥ ~1k followers) | Fanout-on-read   |
 
 Why:
-- Fanout-on-write causes write amplification for celebs
-- Fanout-on-read causes slow feed reads for normal users
+- Fanout-on-write amplifies writes for celebs (too expensive)
+- Fanout-on-read makes normal users’ reads slow (too expensive)
 
-## Celebrity / Hot User Handling
+## Celebrity / hot user handling
 - For high-fanout authors:
-  - Do not fanout on write
+  - Don’t fanout on write
   - Store post in Post DB; cache recent posts per author (small list)
   - On feed read: identify followed high-fanout authors and merge their recent posts
-- Prevents Redis/CPU meltdown during celebrity posts
+- Prevents Redis/CPU meltdown on celebrity posts.
 
-## Data Model
-### Post Table
+## Data model
+### Post
 ```
 Post {
-  postId
-  authorId
-  content
-  mediaUrl
-  createdAt
-  likeCount
+  postId,
+  authorId,
+  content,
+  mediaUrl,
+  createdAt,
+  likeCount,
   commentCount
 }
 ```
 
-### Follow Store
+### Follow
 ```
 Follow {
-  userId        // follower
-  followeeId    // followed user
+  userId,      // follower
+  followeeId   // followed user
 }
 ```
 
-### User Feed Table (Redis / Cassandra)
+### UserFeed (Redis/Cassandra)
 ```
 UserFeed {
-  userId
-  [
-    (postId, createdAt, authorId)
-  ]
+  userId,
+  [ (postId, createdAt, authorId) ]
 }
 ```
 
-> Store ONLY post IDs, not full posts — prevents duplication & large memory usage.
+### FeedItem (minimum viable)
+```
+FeedItem {
+  feedUserId,
+  postId,
+  authorId,
+  createdAt,
+  rankScore,
+  sourceType // fanout-write | fanout-read
+}
+```
 
-## Write Path (Post Creation)
-1. User creates post
-2. Post saved in Post DB
-3. Event published to Kafka
-4. Feed Service:
+Store ONLY post IDs in user feeds (not full posts) to avoid duplication and reduce memory.
+
+## Write path (post creation)
+1) User creates post
+2) Post saved in Post DB
+3) Event published to Kafka
+4) Feed Service:
    - If author followers < threshold → push postId to followers’ feeds (fanout-on-write)
-   - Else → do nothing (handled on read for celebs)
+   - Else → skip fanout (handled on read for celebs)
 
-## Read Path (Feed Fetch)
-1. Client requests feed
-2. Feed Service fetches:
-   - Precomputed feed (fanout-on-write)
+## Read path (feed fetch)
+1) Client requests feed
+2) Feed Service fetches:
+   - Precomputed feed page (fanout-on-write)
    - Recent posts from celeb followings (fanout-on-read)
-3. Merge + sort by time / rank
-4. Batch fetch post details
-5. Return paginated feed
+3) Merge + sort (by time/rank)
+4) Batch fetch post details
+5) Apply lightweight ranking if needed; cache the result (short TTL)
+6) Return paginated feed
 
-> Redis-first always. DB is not scanned to rebuild feeds on read.
+Redis-first for performance; the DB is not scanned to rebuild feeds during read.
 
-## Ranking Strategy
-- Initial MVP: reverse chronological
-- Later add:
+## Ranking strategy
+- MVP: reverse chronological
+- Evolve to include:
   - Engagement score
   - Recency decay
   - User affinity
-- Performance:
+- Implementation notes:
   - Redis sorted sets; score ≈ `createdAt + epsilon * engagement`
-  - O(log N) insert, O(K) read
-- Ranking is a separate service (important callout)
+  - O(log N) insert; O(K) read
+- Ranking is a separate service.
 
-## Caching Strategy
-- Cache user feed in Redis
+## Caching strategy
+- Cache user feed pages in Redis (short TTL)
 - Cache post objects separately
 - Use TTL + LRU
 - Cache top N (e.g., 500 posts/user)
 
 ## Pagination
-- Cursor-based pagination
-- Use `(createdAt, postId)` as cursor
-- Avoid offset-based pagination (slow)
+- Cursor-based pagination using `(createdAt, postId)`
+- Avoid offset-based pagination (slow and inconsistent)
 
-## Delivery Semantics (Fanout)
-- At-least-once delivery; exactly-once is avoided (too expensive)
+## Delivery semantics (fanout)
+- At-least-once delivery; exactly-once generally avoided (too expensive)
 - Duplicate handling:
-  - Idempotent writes: `(userId, postId)` unique
-  - Redis `ZADD NX` for dedup at insert
+  - Idempotent writes: enforce `(userId, postId)` uniqueness
+  - Redis `ZADD NX` (or equivalent) for dedup on insert
   - Optional read-time dedup by `postId`
 
-## Failure Handling
-- Kafka lag → feed delay acceptable
+## Failure handling
+- Kafka lag → acceptable feed delay
 - Cache miss → fallback to DB
 - Feed rebuild job for corrupted feeds
 - Graceful degradation (skip ranking if needed)
+- Service robustness:
+  - Feed Service is stateless; multiple replicas behind LB
+  - Auto-scaling + health checks
+  - If cache down → serve from Feed DB, rate-limit if needed
+  - Fanout worker lag → eventual consistency; users may see posts slightly late
 
-## Redis Failure Handling
-- Goals: avoid total outage; degrade gracefully
-- Strategy:
+## Redis failure handling
+- Degrade gracefully; avoid total outage
+- Strategies:
   - Serve stale feeds if Redis unstable
   - Pause fanout workers during incidents
   - Rate-limit DB fallback reads
   - Redis auto-failover for node failures
   - Lazy cache repopulation after recovery
 
-> Redis is an optimization layer, not a hard dependency.
+Redis is an optimization layer, not a hard dependency.
 
-## Consistency Model
+## Consistency model
 - Eventual consistency
-- Feed delay of few seconds acceptable
+- Feed delay of a few seconds acceptable
 - Likes/comments updated asynchronously
