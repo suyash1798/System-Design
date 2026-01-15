@@ -1,112 +1,98 @@
 # WhatsApp – System Design
 
----
-
 ## Scope & Priorities
-### In Scope
+### In scope
 - 1–1 chat
-- Group chat (max ~200 users)
+- Group chat (small groups; large groups discussed separately)
 - Push notifications
 
-### Out of Scope
-- Media (images/videos)
-- Read receipts
-- Last seen / online status
+### Out of scope
+- Audio & video calls
+- Deep crypto internals (E2EE details)
 
-### Core Priorities
+### Core priorities
 - Low latency → chat UX dies if slow
 - Strict ordering → non-negotiable for trust
-- Ordering path is effectively CP (Consistency + Partition tolerance): short availability sacrifices are acceptable to preserve order; other non-ordering components aim for high availability.
+- Ordering path is effectively CP (Consistency + Partition tolerance): small availability sacrifices are acceptable to preserve order; other components aim for high availability.
 
-## Problem Statement
+## Problem statement
 Design a globally scalable real-time messaging system similar to WhatsApp that supports:
-- Billions of users
-- Millions of concurrent connections
-- Reliable message delivery
-- Ordered messaging
-- Offline support
-- Multi-device sync
+- Billions of users; millions of concurrent connections
+- Reliable message delivery with ordered messaging
+- Offline support and multi-device sync
 
 ## Requirements
-
 ### Functional
-- 1:1 messaging
-- Group messaging
+- 1:1 and group messaging
 - Message status: sent / delivered / read
 - Offline message delivery
 - Multi-device support
-- Media sharing (images, videos, docs)
+- Media references (objects in separate store)
 - Push notifications
+- Presence (online / last seen) – eventual consistency
 
-### Non-Functional
+### Non-functional
 - Scale: 1B+ users, 100M+ concurrent connections
 - Throughput: millions of messages/sec (peak)
-- Send ACK latency < 50ms (regional)
-- Delivery latency p99 < 200ms
-- FIFO ordering per conversation
-- No message loss (delay acceptable)
-- High availability at the service level; CP for the ordering/commit path
+- Send ACK latency < 50 ms (regional); delivery p99 < 200 ms
+- FIFO ordering per conversation; no message loss (delay acceptable)
+- High availability at service level; CP for ordering/commit path
 
-### Out of Scope
-- Payments
-- Status / stories
-- Audio & video calls
-- Cryptography deep dive (E2EE internals)
+### Out of scope
+- Payments, status/stories
+- Audio/video calls
+- Cryptography deep dive
 
-## Scale Assumptions (Rough but Realistic)
-- DAU: ~100M+
+## Scale assumptions (rough but realistic)
+- DAU: 100M–500M
 - Concurrent users: ~5–10% of DAU
-- Messages/user/day: 30–60
-- Message size (text): ~0.5–1 KB
-- Max group size: 200; avg group size: 50–100
-- P99 latency: sender ACK < 50–100 ms; delivery < 200 ms
+- Messages/user/day: 30–100 → 3B–50B/day (~35k–580k msg/sec avg; peaks to millions/sec)
+- Message size: ~1 KB payload (~2 KB with metadata)
+- Small groups: ≤ 200; large groups: up to 10k+
 
-## High-Level Architecture
-### Core Components
+## Communication protocol
+- WebSocket over TCP; long-lived, bi-directional
+- Auth during handshake (token-based)
+- Auto-reconnect with resume (client sends last_received_seq_no)
+
+## High-level architecture
+Core components:
 - Client (persistent connection: WebSocket/TCP)
 - API Gateway
 - Connection Gateway (WebSocket termination)
-- Chat Service
+- Chat Service (stateless)
 - Sequencer Service (sharded by conversation/chatId)
 - Append-only durable log (Kafka-like/WAL)
-- Message Store (long-term)
+- Message Store (source of truth)
 - Media Store (Object Storage + CDN)
-- Fanout Service
+- Fanout Service (async workers)
 - Push Notification Service
+- Connection Registry (userId → serverId mapping)
 
-### Key Principle
-Separate connections, ordering, and delivery — never mix them.
+Key principle: separate connections, ordering, and delivery — never mix them.
 
-## Connection Management
-### Key Ideas
+## Connection management
 - Each device maintains its own WebSocket connection
-- Identity = (userId, deviceId) — IP is not identity
+- Identity = (userId, deviceId); IP is not identity
 - Connections terminate at Connection Gateways
-
-### State Handling
-- Live connection state → in-memory at gateways
-- Lightweight shared mapping: userId → active gateways
+- Live connection state in-memory at gateways; shared mapping userId → active gateways
 - Gateways are stateless & disposable
+- Failure: gateway crash → disconnect → client reconnects (LB); missed messages resynced on reconnect
 
-### Failure Handling
-- Gateway crash → connection drops; client reconnects via Load Balancer
-- Missed messages are synced on reconnect
+## Message flow (1–1 chat)
+1) Client sends message over persistent connection
+2) API Gateway → Chat Service
+3) Chat Service calls Sequencer (per chat shard)
+4) Sequencer assigns monotonic sequenceNumber/messageId
+5) Message appended to durable log; persisted in Message Store
+6) Sender gets Sent ACK (after durability)
+7) Fanout to receiver shard/device
+8) Receiver device gets message
+9) Receiver sends Delivered ACK
 
-## Message Flow (1–1 Chat)
-1. Client sends message over persistent connection
-2. API Gateway → Chat Service
-3. Chat Service calls Sequencer (per chat shard)
-4. Sequencer assigns monotonic messageId
-5. Message appended to durable log
-6. Sender gets Sent ACK (single tick)
-7. Message fanout to receiver shard/device
-8. Receiver device gets message
-9. Receiver sends Delivered ACK (double tick)
+Sender ACK does NOT wait for receiver ACK.
 
-Note: Sender ACK does NOT wait for receiver ACK.
-
-## ACK Semantics (Very Important)
-
+## ACK semantics
 | ACK Type  | When it is sent           | Purpose               |
 |-----------|---------------------------|-----------------------|
 | Sent      | After durable persistence | Guarantees no loss    |
@@ -115,133 +101,123 @@ Note: Sender ACK does NOT wait for receiver ACK.
 
 Rule: never ACK before durability. There is no single ACK.
 
-## Message Ordering (Core Concept)
-### Ordering Scope
-- FIFO per conversation
-- Not global; not per user
+## Ordering guarantees (core)
+- FIFO per conversation; not global; not per user
+- Map conversations to sequencer shards; all messages for a chat go through the same shard
+- Sequencer assigns monotonic sequence; fanout occurs after ordering
+- Client buffers; delivers only lastSeq + 1; fetch missing messages on gaps
 
-### How Ordering Works
-- Conversations are mapped to sequencer shards
-- All messages for a conversation go through the same shard
-- Sequencer assigns monotonic sequenceNumber
-- Fanout happens after ordering
+## Sequencer design
+What it is:
+- Logical service responsible only for ordering
 
-### Client Handling
-- Buffer messages
-- Deliver only lastSeq + 1
-- Fetch missing messages if gaps appear
+What it isn’t:
+- Redis INCR; DB auto-increment; global counter
 
-## Sequencer Design
-### What Sequencer Is
-- A logical service, not a database
-- Responsible only for ordering
-
-### What Sequencer Is NOT
-- ❌ Redis INCR
-- ❌ DB auto-increment
-- ❌ Global counter
-
-### Correct Model
-- One leader sequencer per chat, sharded by chatId
-- Fixed number of sequencer shards; `hash(conversationId) → shard`
+Model:
+- One leader sequencer per chat, sharded by chatId (`hash(conversationId) → shard`)
 - Append-only ordering; sequence = log offset
 
-### Sequencer Failure Handling
+Failure handling:
 - Leader–follower replication; only leader assigns IDs
-- State persisted in durable log
-- On crash: new leader elected (ZooKeeper/Raft), reads last committed messageId, continues without gaps
-- Chat Service is NOT source of truth for ordering
+- State persisted in durable log; on crash elect new leader (ZooKeeper/Raft), read last committed offset, continue without gaps
+- Chat Service is not the source of truth for ordering
 
-## Storage Model
-### Message Schema (Conceptual)
-- `messageId`
-- `conversationId`
-- `senderId`
-- `sequenceNumber`
-- `payload` / media reference
-- `timestamp`
-- `delete` tombstone flag
+## Storage model (conceptual)
+Message fields:
+- messageId, conversationId, senderId, sequenceNumber, payload/mediaRef, timestamp, delete tombstone
 
-### Retention
-- Stored until all active devices sync, plus retention window
-- Media stored separately with TTL
+Retention:
+- Stored until devices sync + retention window; media separate with TTL
+- Per-chat append-only log (not per-user inbox) enables replay and natural ordering
 
-- Per-chat append-only log (not per-user inbox) for easy replay and natural ordering
+## Storage design (Cassandra/HBase style)
+Optimized for high write throughput, ordered reads, and horizontal scale.
 
-## Group Messaging & Fanout
-### Strategy
+Message table:
+- Partition Key: chat_id
+- Clustering Key: sequence_no (ASC)
+- Columns: message_id, sender_id, content (encrypted), timestamp
+
+User message state table:
+- Partition Key: user_id
+- Clustering Key: (chat_id, message_id)
+- Columns: read_at, deleted_flag
+
+Delete semantics:
+- Delete for me → per-user delete flag; client hides message
+- Delete for everyone → special control message; clients replace content
+
+## Group messaging & fanout
+Strategy:
 - 1–1 chat → fanout-on-write (push)
-- Group chat (≤ 200 users) → fanout-on-write is safe and predictable
+- Small groups (≤ ~200) → fanout-on-write is safe and predictable
+- Large groups (≥ ~10k) → prefer fanout-on-read to avoid write/cache explosion; store once per chat and resolve recipients dynamically on read
 
-Note: Fanout-on-read is for feeds, not chat.
+Note: Fanout-on-read is typical for feeds; use it for extreme-size groups only.
 
-### Large Group Handling
-- Batch fanout
-- Push notification collapse
-- Rate limits per group
-- Slow-path delivery for huge groups
+Large group handling:
+- Batch fanout when pushing; collapse push notifications
+- Rate limits per group; slow-path delivery for huge groups
 
-## Multi-Device Sync & Offline Handling
-- Each device tracks `lastSeenSequence`
+## Multi-device sync & offline handling
+- Each device tracks lastSeenSequence
 - Online user → immediate push
 - Offline user → store + push notification
-- On reconnect/new device → replay from last delivered ID; fetch messages where `seq > lastSeen`
+- On reconnect/new device → replay from last delivered ID; fetch where `seq > lastSeen`
 - Media fetched lazily; ordering preserved across devices
 
-## Scaling Strategy & Bottlenecks
-### Dimensions
-- Users, Connections, Messages, Groups, Devices, Regions
+## Presence
+- Eventual consistency for presence (online/last seen)
+- Publish/subscribe updates; tolerate brief staleness
 
-### Horizontal Scaling
+## Scaling strategy & bottlenecks
+Dimensions: users, connections, messages, groups, devices, regions
+
+Horizontal scaling:
 - Connection Gateways scale independently
 - Chat Service is stateless
-- Sequencer sharded by conversation
+- Sequencer shards by conversation
 - Fanout via async workers
 
-### First Bottleneck to Break
-- Network egress, not storage
+First bottleneck to break: network egress, not storage
 
-## Key Optimizations
-- Batch fanout per shard
-- Reuse persistent connections
-- Compress payloads
-- Region-local delivery
-- Avoid duplicate sends
-- Client-side dedup (mandatory)
+## Key optimizations
+- Batch fanout per shard; reuse persistent connections
+- Compress payloads; region-local delivery
+- Avoid duplicate sends; mandatory client-side dedup
 
-## Backpressure & Protection
-- Rate limits per user & group
-- Queue depth monitoring
-- Drop non-critical features first
-- Protect core messaging path
+## Backpressure & protection
+- Rate limits per user & group; monitor queue depth
+- Drop non-critical features first; protect core messaging path
 
-## Failure Handling
-### Connection Gateway Failure
+## Failure handling
+Connection Gateway failure:
 - Client reconnects; messages resynced
 
-### Chat Service Failure
-- ACK only after durability; retries use same `messageId`
-- Idempotent writes
+Chat Service failure:
+- ACK only after durability; retries reuse same messageId; idempotent writes
 
-### Sequencer Failure
+Sequencer failure:
 - Restart from last committed offset; ordering preserved
 
-### Fanout Failure
-- At-least-once delivery; retry until device ACK
+Fanout failure:
+- At-least-once delivery; retry until device ACK; clients dedup via sequence/messageId
 
-### Storage Failure
-- Multi-AZ replication
-- Backpressure → delay ACKs (never skip durability)
+Storage failure:
+- Multi-AZ replication; apply backpressure → delay ACKs (never skip durability)
 
 ## Observability
 Track:
-- Send ACK latency
-- Delivery lag
-- Fanout backlog
-- Sequencer hot shards
+- Send ACK latency; delivery lag
+- Fanout backlog; sequencer hot shards
 - Retry rates
 
-## Rapid-Fire Interview Truths (Memorize)
-- Clients generate IDs? ❌ Only client UUID for retries, not ordering
-- Out-of-order delivery allowed? ❌ No — strict FIFO per conversation
-- Kafka mandatory? ❌ No — any durable append-only log/WAL works
+---
+
+## End-to-End Encryption (high-level)
+- Encryption happens on clients; server sees ciphertext only
+- Key model (simplified): public key shared; private key stays on device
+- Sender encrypts with receiver’s public key; receiver decrypts with private key
+- Offline messages with E2EE: encrypted payload stored and delivered as-is; server cannot decrypt
+- Challenges: multi-device keys, key rotation, secure backup/restore, group key management
